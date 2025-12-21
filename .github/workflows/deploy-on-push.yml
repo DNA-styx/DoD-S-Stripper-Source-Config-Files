@@ -1,19 +1,9 @@
-name: Deploy changed .cfg files via SFTP (commit-based, no dry-run)
+name: Deploy changed .cfg files via SFTP (commit-based, push-only)
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      run_mode:
-        description: 'Run mode: "changed" (only files changed in the push) or "full" (upload all tracked .cfg files under REPO_PREFIX).'
-        required: false
-        default: 'full'
-      ref:
-        description: 'Branch/ref to checkout when running manually (optional).'
-        required: false
-        default: 'main'
 
 jobs:
   deploy:
@@ -46,33 +36,25 @@ jobs:
       SERVER3_PORT: ${{ secrets.SERVER3_PORT }}
 
     steps:
-      - name: "Checkout repository (full history)"
+      - name: Checkout repository (full history)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: "Optionally checkout requested ref (workflow_dispatch)"
-        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref != '' }}
-        run: |
-          REF="${{ github.event.inputs.ref }}"
-          echo "workflow_dispatch requested ref: $REF"
-          git fetch origin "$REF" --depth=1 || true
-          git checkout "$REF" || git checkout -b "$REF" "origin/$REF" || true
-
-      - name: "Install sshpass"
+      - name: Install sshpass
         run: |
           sudo apt-get update
           sudo apt-get install -y sshpass
 
-      - name: "Determine changed .cfg files (robust)"
+      - name: Determine changed .cfg files (push / changed mode)
         id: changed
         env:
-          RUN_MODE: ${{ github.event.inputs.run_mode }}
           BEFORE: ${{ github.event.before }}
           AFTER: ${{ github.sha }}
         run: |
           set -euo pipefail
-          RUN_MODE="${RUN_MODE:-changed}"
+          # For push-triggered runs we operate in "changed" mode:
+          RUN_MODE='changed'
           BEFORE="${BEFORE}"
           AFTER="${AFTER}"
           REPO_PREFIX="${REPO_PREFIX%/}"
@@ -87,28 +69,24 @@ jobs:
             git fetch origin "$AFTER":"refs/remotes/origin/$AFTER" || true
           fi
 
-          if [ "$RUN_MODE" = "full" ] || [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+          # CHANGED mode (push): diff between BEFORE and AFTER, filtered to .cfg under prefix
+          (git --no-pager diff --name-only "$BEFORE" "$AFTER" \
+            | grep -E -i "^${REPO_PREFIX}(/|$)" \
+            | grep -E -i '\.cfg$') > changed.txt || true
+
+          # Fallback: if diff produced nothing, list .cfg files from AFTER commit under prefix
+          if [ ! -s changed.txt ]; then
             (git ls-tree -r --name-only "${AFTER}" \
               | grep -E -i "^${REPO_PREFIX}(/|$)" \
               | grep -E -i '\.cfg$') > changed.txt || true
-          else
-            (git --no-pager diff --name-only "$BEFORE" "$AFTER" \
-              | grep -E -i "^${REPO_PREFIX}(/|$)" \
-              | grep -E -i '\.cfg$') > changed.txt || true
-            if [ ! -s changed.txt ]; then
-              (git ls-tree -r --name-only "${AFTER}" \
-                | grep -E -i "^${REPO_PREFIX}(/|$)" \
-                | grep -E -i '\.cfg$') > changed.txt || true
-            fi
           fi
 
-          # Ensure file exists
           touch changed.txt
-          echo "Changed files:"
+          echo "Changed .cfg files:"
           nl -ba changed.txt || true
           echo "files=$(wc -l < changed.txt || true)" >> "$GITHUB_OUTPUT"
 
-      - name: "Upload / remove changed .cfg files (from commit content)"
+      - name: Upload / remove changed .cfg files (from commit content)
         if: ${{ always() }}
         env:
           AFTER: ${{ github.sha }}
