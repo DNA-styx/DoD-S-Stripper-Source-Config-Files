@@ -1,3 +1,4 @@
+# Deploy changed .cfg files via SFTP (improved upload diagnostics)
 name: Deploy changed .cfg files via SFTP
 
 on:
@@ -24,25 +25,21 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Path inside your repo that contains the .cfg files to deploy
       REPO_PREFIX: 'addons/sourcemod/configs/stripper'
       VERBOSE: 'true'
 
-      # Server 1 (required for initial testing)
       SERVER1_HOST: ${{ secrets.SERVER1_HOST }}
       SERVER1_USER: ${{ secrets.SERVER1_USER }}
       SERVER1_PASS: ${{ secrets.SERVER1_PASS }}
       SERVER1_REMOTE_BASE: ${{ secrets.SERVER1_REMOTE_BASE }}
       SERVER1_PORT: ${{ secrets.SERVER1_PORT }}
 
-      # Server 2 (optional)
       SERVER2_HOST: ${{ secrets.SERVER2_HOST }}
       SERVER2_USER: ${{ secrets.SERVER2_USER }}
       SERVER2_PASS: ${{ secrets.SERVER2_PASS }}
       SERVER2_REMOTE_BASE: ${{ secrets.SERVER2_REMOTE_BASE }}
       SERVER2_PORT: ${{ secrets.SERVER2_PORT }}
 
-      # Server 3 (optional)
       SERVER3_HOST: ${{ secrets.SERVER3_HOST }}
       SERVER3_USER: ${{ secrets.SERVER3_USER }}
       SERVER3_PASS: ${{ secrets.SERVER3_PASS }}
@@ -63,31 +60,12 @@ jobs:
           git fetch origin "$REF" --depth=1 || true
           git checkout "$REF" || git checkout -b "$REF" "origin/$REF" || true
 
-      - name: "Install sshpass (for password-based non-interactive sftp/scp)"
+      - name: "Install sshpass"
         run: |
           sudo apt-get update
           sudo apt-get install -y sshpass
 
-      - name: "Debug: show tracked files & prefix (always runs, safe)"
-        run: |
-          echo "REPO_PREFIX = '${REPO_PREFIX}'"
-          echo "Current Git branch:"
-          git rev-parse --abbrev-ref HEAD || true
-          echo
-          echo "Top 200 tracked files:"
-          git ls-files | sed -n '1,200p' || true
-          echo
-          echo "Files matching REPO_PREFIX (${REPO_PREFIX}):"
-          git ls-files | grep -E -i "^${REPO_PREFIX}(/|$)" || true
-          echo
-          if [ -d "${REPO_PREFIX}" ]; then
-            echo "Local dir ${REPO_PREFIX} exists — listing:"
-            ls -la "${REPO_PREFIX}" || true
-          else
-            echo "Local dir ${REPO_PREFIX} does not exist."
-          fi
-
-      - name: "Determine changed .cfg files (robust + verbose)"
+      - name: "Determine changed .cfg files (robust)"
         id: changed
         env:
           RUN_MODE: ${{ github.event.inputs.run_mode }}
@@ -98,13 +76,9 @@ jobs:
           RUN_MODE="${RUN_MODE:-changed}"
           BEFORE="${BEFORE}"
           AFTER="${AFTER}"
-          echo "RUN_MODE=$RUN_MODE"
-          echo "BEFORE=$BEFORE"
-          echo "AFTER=$AFTER"
-          echo "REPO_PREFIX='${REPO_PREFIX}'"
           REPO_PREFIX="${REPO_PREFIX%/}"
+          echo "RUN_MODE=$RUN_MODE BEFORE=$BEFORE AFTER=$AFTER REPO_PREFIX=$REPO_PREFIX"
 
-          # Ensure we have relevant commits locally
           git fetch --no-tags --prune origin || true
           if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             git fetch origin "$BEFORE":"refs/remotes/origin/$BEFORE" || true
@@ -113,41 +87,27 @@ jobs:
             git fetch origin "$AFTER":"refs/remotes/origin/$AFTER" || true
           fi
 
-          echo "Files in AFTER commit (top 200):"
-          git ls-tree -r --name-only "${AFTER}" | sed -n '1,200p' || true
-          echo "----"
-
-          # Build changed.txt (capture pipeline output safely)
           if [ "$RUN_MODE" = "full" ] || [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-            echo "FULL mode or initial commit — listing all .cfg files under REPO_PREFIX in AFTER commit"
             (git ls-tree -r --name-only "${AFTER}" \
               | grep -E -i "^${REPO_PREFIX}(/|$)" \
               | grep -E -i '\.cfg$') > changed.txt || true
           else
-            echo "CHANGED mode — raw diff between BEFORE and AFTER:"
-            git --no-pager diff --name-only "$BEFORE" "$AFTER" | sed -n '1,200p' || true
             (git --no-pager diff --name-only "$BEFORE" "$AFTER" \
               | grep -E -i "^${REPO_PREFIX}(/|$)" \
               | grep -E -i '\.cfg$') > changed.txt || true
-
             if [ ! -s changed.txt ]; then
-              echo "Diff returned no .cfg files; falling back to listing .cfg files from AFTER commit under prefix"
               (git ls-tree -r --name-only "${AFTER}" \
                 | grep -E -i "^${REPO_PREFIX}(/|$)" \
                 | grep -E -i '\.cfg$') > changed.txt || true
             fi
           fi
 
-          if [ ! -f changed.txt ]; then
-            touch changed.txt
-          fi
-
-          echo "Final changed .cfg files (changed.txt):"
-          sed -n '1,500p' changed.txt || true
-          echo "Count: $(wc -l < changed.txt || true)"
+          touch changed.txt
+          echo "Changed files:"
+          nl -ba changed.txt || true
           echo "files=$(wc -l < changed.txt || true)" >> "$GITHUB_OUTPUT"
 
-      - name: "Upload / remove changed .cfg files to configured servers (from commit content)"
+      - name: "Upload / remove changed .cfg files (upload from commit with diagnostics)"
         if: ${{ always() }}
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run }}
@@ -158,12 +118,11 @@ jobs:
           REPO_PREFIX="${REPO_PREFIX%/}"
           AFTER="${AFTER}"
 
-          if [ ! -f changed.txt ] || [ ! -s changed.txt ]; then
-            echo "No .cfg files matched under prefix '$REPO_PREFIX'. Nothing to do."
+          if [ ! -s changed.txt ]; then
+            echo "No files to process; exiting."
             exit 0
           fi
 
-          echo ">>> changed.txt contents:"
           nl -ba changed.txt || true
           echo "----"
 
@@ -180,22 +139,19 @@ jobs:
                 fi
                 ;;
               *)
-                echo "  -> Skipping because not under REPO_PREFIX"
+                echo "  Skipping (not under REPO_PREFIX)"
                 continue
                 ;;
             esac
 
-            echo "  relpath = '$relpath'"
-
-            # Sanity-check: only .cfg files
+            echo "  relpath='$relpath'"
             if ! echo "$relpath" | grep -E -i '\.cfg$' >/dev/null 2>&1; then
-              echo "  -> Skipping because not a .cfg file"
+              echo "  Skipping (not .cfg)"
               continue
             fi
 
-            # Determine presence in commit/index
             if git --no-pager ls-files --error-unmatch "$f" >/dev/null 2>&1; then
-              echo "  Present in commit — uploading from commit object"
+              echo "  Present in commit — will upload from commit object"
               for i in 1 2 3; do
                 HOST_VAR="SERVER${i}_HOST"; HOST="${!HOST_VAR:-}"
                 if [ -z "$HOST" ]; then
@@ -211,27 +167,67 @@ jobs:
                 remote_target="${REMOTE_BASE%/}/$relpath"
                 remote_dir="$(dirname "$remote_target")"
 
-                if [ "$DRY_RUN" = "true" ]; then
-                  echo "  [DRY] Would ensure remote dir on server${i}: $HOST -> $remote_dir"
-                  echo "  [DRY] Would upload file to server${i}: $remote_target"
-                else
-                  # Create remote directory
-                  sshpass -p "$PASS" ssh -p "${PORT:-22}" -o StrictHostKeyChecking=no "$USER@$HOST" "mkdir -p '$remote_dir'"
+                echo "  Server $i: host=$HOST user=$USER target=$remote_target"
 
-                  # Write file from commit to a temp file and scp it
-                  tmpf="$(mktemp)"
-                  if git show "${AFTER}:$f" > "$tmpf" 2>/dev/null; then
-                    sshpass -p "$PASS" scp -P "${PORT:-22}" -p "$tmpf" "$USER@$HOST:$remote_target"
-                    echo "  Uploaded to server${i}: $remote_target"
-                    rm -f "$tmpf"
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "    [DRY] would: mkdir -p $remote_dir ; scp <tmpfile> -> $remote_target"
+                  continue
+                fi
+
+                # create remote dir
+                echo "    Ensuring remote dir: ssh -p ${PORT:-22} $USER@$HOST mkdir -p '$remote_dir'"
+                sshpass -p "$PASS" ssh -p "${PORT:-22}" -o StrictHostKeyChecking=no "$USER@$HOST" "mkdir -p '$remote_dir'" || echo "    Warning: mkdir on $HOST returned non-zero"
+
+                # attempt git show -> temp file
+                tmpf="$(mktemp)"
+                echo "    git show '${AFTER}:$f' -> $tmpf"
+                if git show "${AFTER}:$f" > "$tmpf" 2> "$tmpf.err"; then
+                  echo "    git show OK (size: $(stat -c%s "$tmpf"))"
+                else
+                  echo "    git show FAILED exit=$? ; stderr:"
+                  sed -n '1,200p' "$tmpf.err" || true
+                  rm -f "$tmpf" "$tmpf.err"
+                  # fallback: try to checkout the file into workspace and upload from there
+                  echo "    Fallback: trying 'git checkout ${AFTER} -- \"$f\"' into worktree"
+                  if git checkout "${AFTER}" -- "$f" 2> /tmp/gitcheckout.err; then
+                    echo "    git checkout succeeded; will upload from workspace path '$f'"
+                    echo "    ls -l '$f':"
+                    ls -l "$f" || true
+                    tmpf=""  # indicate using workspace file
                   else
-                    echo "  ERROR: git show failed for ${AFTER}:$f — skipping server${i}"
-                    rm -f "$tmpf"
+                    echo "    git checkout failed; stderr:"
+                    sed -n '1,200p' /tmp/gitcheckout.err || true
+                    echo "    Skipping upload for this server"
+                    continue
+                  fi
+                fi
+
+                # perform scp and capture stderr+exit code
+                if [ -n "$tmpf" ]; then
+                  echo "    scp $tmpf -> $USER@$HOST:$remote_target"
+                  if sshpass -p "$PASS" scp -P "${PORT:-22}" -p "$tmpf" "$USER@$HOST:$remote_target" 2> "$tmpf.scp.err"; then
+                    echo "    scp succeeded"
+                    rm -f "$tmpf" "$tmpf.err" "$tmpf.scp.err" || true
+                  else
+                    echo "    scp FAILED exit=$? ; stderr:"
+                    sed -n '1,200p' "$tmpf.scp.err" || true
+                    rm -f "$tmpf" "$tmpf.err" "$tmpf.scp.err" || true
+                  fi
+                else
+                  # using workspace file path $f
+                  echo "    scp $f -> $USER@$HOST:$remote_target"
+                  if sshpass -p "$PASS" scp -P "${PORT:-22}" -p "$f" "$USER@$HOST:$remote_target" 2> /tmp/scp.err; then
+                    echo "    scp succeeded (from workspace)"
+                    rm -f /tmp/scp.err || true
+                  else
+                    echo "    scp FAILED ; stderr:"
+                    sed -n '1,200p' /tmp/scp.err || true
+                    rm -f /tmp/scp.err || true
                   fi
                 fi
               done
             else
-              echo "  NOT present in commit (deleted) — removing remote file on configured servers"
+              echo "  NOT present in commit (treated as deleted) — will remove remote entries"
               for i in 1 2 3; do
                 HOST_VAR="SERVER${i}_HOST"; HOST="${!HOST_VAR:-}"
                 if [ -z "$HOST" ]; then
@@ -245,10 +241,10 @@ jobs:
                 fi
                 remote_target="${REMOTE_BASE%/}/$relpath"
                 if [ "$DRY_RUN" = "true" ]; then
-                  echo "  [DRY] Would remove remote file on server${i}: $remote_target"
+                  echo "    [DRY] Would remove $remote_target on $HOST"
                 else
-                  sshpass -p "$PASS" ssh -p "${PORT:-22}" -o StrictHostKeyChecking=no "$USER@$HOST" "rm -f '$remote_target' || true"
-                  echo "  Removed remote file on server${i}: $remote_target"
+                  echo "    Removing $remote_target on $HOST"
+                  sshpass -p "$PASS" ssh -p "${PORT:-22}" -o StrictHostKeyChecking=no "$USER@$HOST" "rm -f '$remote_target' || true" || echo "    Warning: remote rm returned non-zero"
                 fi
               done
             fi
@@ -259,7 +255,7 @@ jobs:
       - name: "Summary"
         if: ${{ always() }}
         run: |
-          echo "Workflow finished. Check logs above for upload/remove actions."
+          echo "Workflow finished."
           if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
-            echo "This was a dry run. To perform real uploads, run this workflow with dry_run = 'false'."
+            echo "This was a dry run; re-run with dry_run = false to upload."
           fi
