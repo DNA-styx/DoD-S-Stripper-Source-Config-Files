@@ -24,11 +24,11 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Path in repo that contains the .cfg files
+      # Path inside your repo that contains the .cfg files you want to deploy
       REPO_PREFIX: 'addons/sourcemod/configs/stripper'
       VERBOSE: 'true'
 
-      # Server 1 (required)
+      # Server 1 (required for initial testing)
       SERVER1_HOST: ${{ secrets.SERVER1_HOST }}
       SERVER1_USER: ${{ secrets.SERVER1_USER }}
       SERVER1_PASS: ${{ secrets.SERVER1_PASS }}
@@ -50,12 +50,12 @@ jobs:
       SERVER3_PORT: ${{ secrets.SERVER3_PORT }}
 
     steps:
-      - name: Checkout repository (full history)
+      - name: "Checkout repository (full history)"
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Optionally checkout requested ref (workflow_dispatch)
+      - name: "Optionally checkout requested ref (workflow_dispatch)"
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.ref != '' }}
         run: |
           REF="${{ github.event.inputs.ref }}"
@@ -63,7 +63,7 @@ jobs:
           git fetch origin "$REF" --depth=1 || true
           git checkout "$REF" || git checkout -b "$REF" "origin/$REF" || true
 
-      - name: Install sshpass (for password-based non-interactive sftp/scp)
+      - name: "Install sshpass (for password-based non-interactive sftp/scp)"
         run: |
           sudo apt-get update
           sudo apt-get install -y sshpass
@@ -87,7 +87,7 @@ jobs:
             echo "Local dir ${REPO_PREFIX} does not exist."
           fi
 
-      - name: Determine changed .cfg files
+      - name: "Determine changed .cfg files (robust + verbose)"
         id: changed
         env:
           RUN_MODE: ${{ github.event.inputs.run_mode }}
@@ -96,22 +96,46 @@ jobs:
         run: |
           set -euo pipefail
           RUN_MODE="${RUN_MODE:-changed}"
-          echo "Run mode: $RUN_MODE"
-          echo "Repo prefix: $REPO_PREFIX"
+          BEFORE="${BEFORE}"
+          AFTER="${AFTER}"
+          echo "RUN_MODE=$RUN_MODE"
+          echo "BEFORE=$BEFORE"
+          echo "AFTER=$AFTER"
+          echo "REPO_PREFIX='${REPO_PREFIX}'"
           REPO_PREFIX="${REPO_PREFIX%/}"
 
-          if [ "$RUN_MODE" = "full" ]; then
-            echo "Listing all tracked .cfg files under '$REPO_PREFIX'..."
-            git ls-files | grep -E -i "^${REPO_PREFIX}(/|$)" | grep -E -i '\.cfg$' || true > changed.txt
+          # Ensure we have relevant commits locally
+          git fetch --no-tags --prune origin || true
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            git fetch origin "$BEFORE":"refs/remotes/origin/$BEFORE" || true
+          fi
+          if [ -n "$AFTER" ]; then
+            git fetch origin "$AFTER":"refs/remotes/origin/$AFTER" || true
+          fi
+
+          # Show files in AFTER commit (debug)
+          echo "Files in AFTER commit (top 200):"
+          git ls-tree -r --name-only "${AFTER}" | sed -n '1,200p' || true
+          echo "----"
+
+          # Build changed.txt
+          if [ "$RUN_MODE" = "full" ] || [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "FULL mode or initial commit — listing all .cfg files under REPO_PREFIX in AFTER commit"
+            git ls-tree -r --name-only "${AFTER}" \
+              | grep -E -i "^${REPO_PREFIX}(/|$)" \
+              | grep -E -i '\.cfg$' || true > changed.txt
           else
-            BEFORE="${BEFORE}"
-            AFTER="${AFTER}"
-            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-              echo "No valid 'before' SHA (initial push or manual). Falling back to full listing."
-              git ls-files | grep -E -i "^${REPO_PREFIX}(/|$)" | grep -E -i '\.cfg$' || true > changed.txt
-            else
-              echo "Listing changed .cfg files between $BEFORE and $AFTER"
-              git --no-pager diff --name-only "$BEFORE" "$AFTER" | grep -E -i "^${REPO_PREFIX}(/|$)" | grep -E -i '\.cfg$' || true > changed.txt
+            echo "CHANGED mode — raw diff between BEFORE and AFTER:"
+            git --no-pager diff --name-only "$BEFORE" "$AFTER" | sed -n '1,200p' || true
+            git --no-pager diff --name-only "$BEFORE" "$AFTER" \
+              | grep -E -i "^${REPO_PREFIX}(/|$)" \
+              | grep -E -i '\.cfg$' || true > changed.txt
+
+            if [ ! -s changed.txt ]; then
+              echo "Diff returned no .cfg files; falling back to listing .cfg files from AFTER commit under prefix"
+              git ls-tree -r --name-only "${AFTER}" \
+                | grep -E -i "^${REPO_PREFIX}(/|$)" \
+                | grep -E -i '\.cfg$' || true > changed.txt
             fi
           fi
 
@@ -119,13 +143,12 @@ jobs:
             touch changed.txt
           fi
 
-          echo "Changed .cfg files (matched):"
+          echo "Final changed .cfg files (changed.txt):"
           sed -n '1,200p' changed.txt || true
+          echo "Count: $(wc -l < changed.txt || true)"
+          echo "files=$(wc -l < changed.txt || true)" >> "$GITHUB_OUTPUT"
 
-          files_count="$(wc -l < changed.txt || true)"
-          echo "files=${files_count}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload / remove changed .cfg files to configured servers
+      - name: "Upload / remove changed .cfg files to configured servers"
         if: ${{ always() }}
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run }}
@@ -243,7 +266,7 @@ jobs:
 
           done < changed.txt
 
-      - name: Summary
+      - name: "Summary"
         if: ${{ always() }}
         run: |
           echo "Workflow finished. Check above logs for upload/remove actions."
